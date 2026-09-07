@@ -1,13 +1,39 @@
 /**
- * notes 模块 — 前端 API 客户端。
- *
- * 严格限定在本模块 lib/ 内,不污染核心 @/lib/api.ts。
- * 端点均以 /api/custom/notes/* 为前缀。
+ * notes 模块 — 前端 API 客户端(M1 CRUD)。
  */
 import { ApiError } from '@/lib/api'
 
+export type NoteType = 'knowledge' | 'pitfall' | 'review' | 'idea' | 'question'
+
+export interface Note {
+  id: string
+  type: NoteType
+  title: string | null
+  content: string
+  tags: string[]
+  related_stocks: string[]
+  source_url: string | null
+  source_app: string | null
+  mood: string | null
+  pnl: number | null
+  read_status: string
+  next_review_at: string | null
+  pinned: boolean
+  created_at: string
+  updated_at: string
+  deleted_at: string | null
+  tag_ids?: string[]
+}
+
+export interface Tag {
+  id: string
+  name: string
+  color: string | null
+  use_count: number
+}
+
 export interface NotesHealth {
-  status: 'ok' | string
+  status: string
   module: string
   schema_version: number
   db: boolean
@@ -19,15 +45,44 @@ export interface NotesSchemaVersion {
   migrations: unknown[]
 }
 
+export interface NoteCreatePayload {
+  type: NoteType
+  content: string
+  title?: string
+  tags?: string[]
+  related_stocks?: string[]
+  pinned?: boolean
+}
+
+export interface NoteUpdatePayload {
+  title?: string
+  content?: string
+  tags?: string[]
+  pinned?: boolean
+  type?: NoteType
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
   })
   if (!response.ok) {
-    throw new ApiError(`notes API ${path} failed: ${response.status}`, response.status)
+    const text = await response.text().catch(() => '')
+    throw new ApiError(`notes API ${path} failed: ${response.status} ${text}`, response.status)
   }
   return (await response.json()) as T
+}
+
+async function requestVoid(path: string, init?: RequestInit): Promise<void> {
+  const response = await fetch(path, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+  })
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    throw new ApiError(`notes API ${path} failed: ${response.status} ${text}`, response.status)
+  }
 }
 
 export const notesApi = {
@@ -36,5 +91,44 @@ export const notesApi = {
   },
   schemaVersion(): Promise<NotesSchemaVersion> {
     return request<NotesSchemaVersion>('/api/custom/notes/schema-version')
+  },
+
+  // Notes
+  listNotes(params?: {
+    type?: NoteType
+    search?: string
+    pinned_only?: boolean
+  }): Promise<{ items: Note[]; count: number }> {
+    const qs = new URLSearchParams()
+    if (params?.type) qs.set('type', params.type)
+    if (params?.search) qs.set('search', params.search)
+    if (params?.pinned_only) qs.set('pinned_only', 'true')
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return request<{ items: Note[]; count: number }>(`/api/custom/notes/notes${suffix}`)
+  },
+  getNote(id: string): Promise<Note> {
+    return request<Note>(`/api/custom/notes/notes/${id}`)
+  },
+  createNote(payload: NoteCreatePayload): Promise<Note> {
+    return request<Note>('/api/custom/notes/notes', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updateNote(id: string, payload: NoteUpdatePayload): Promise<Note> {
+    return request<Note>(`/api/custom/notes/notes/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
+  deleteNote(id: string, hard = false): Promise<{ deleted: boolean; hard: boolean; id: string }> {
+    const suffix = hard ? '?hard=true' : ''
+    return requestVoid(`/api/custom/notes/notes/${id}${suffix}`, { method: 'DELETE' })
+      .then(() => ({ deleted: true, hard, id }))
+  },
+
+  // Tags
+  listTags(): Promise<{ items: Tag[]; count: number }> {
+    return request<{ items: Tag[]; count: number }>('/api/custom/notes/tags')
   },
 }
