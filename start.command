@@ -135,16 +135,19 @@ done
 
 # ---------- 8. 汇报 ----------
 echo
+failed=0
 if [[ $backend_ok -eq 1 ]]; then
   ok "后端已就绪"
 else
   err "后端启动超时。查看日志: tail -f .dev-run/backend.log"
+  failed=1
 fi
 
 if [[ $frontend_ok -eq 1 ]]; then
   ok "前端已就绪"
 else
   err "前端启动超时。查看日志: tail -f .dev-run/frontend.log"
+  failed=1
 fi
 
 echo
@@ -154,6 +157,20 @@ echo -e "${BLUE}│${NC}  后端接口   ${YELLOW}http://localhost:$BACKEND_PORT
 echo -e "${BLUE}│${NC}  关闭服务   ${YELLOW}./stop.command${NC}"
 echo -e "${BLUE}╰──────────────────────────────────────────────╯${NC}"
 echo
+
+# 若有任一服务启动失败，给出非零退出码，调用方能感知
+if [[ $failed -ne 0 ]]; then
+  echo -e "${RED}启动未完全成功，请检查上方错误后重试。${NC}"
+  echo
+  # 双击场景：仍允许用户回车关窗 / 超时自动关窗；非交互终端直接退出
+  if [[ "${TERM_PROGRAM:-}" == "Apple_Terminal" ]]; then
+    echo "按回车立即关闭本窗口；不管它的话 30 秒后自动关闭。"
+    read -t 30 -r _ || true
+    nohup bash -c 'sleep 0.3; osascript -e "tell application \"Terminal\" to close front window"' \
+      >/dev/null 2>&1 &
+  fi
+  exit 1
+fi
 
 # ---------- 9. 双击场景结尾：按回车 / 超时后自动关闭窗口 ----------
 # 说明：服务已经在后台跑起来了，关掉这个窗口不会影响服务。
