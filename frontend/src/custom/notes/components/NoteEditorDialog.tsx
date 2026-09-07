@@ -5,8 +5,9 @@
  * - mode=edit:预填现有笔记,提交后更新
  */
 import { useEffect, useRef, useState } from 'react'
+import { Sparkles } from 'lucide-react'
 import { Modal } from '@/components/Modal'
-import { notesApi, type Note, type NoteType, type NoteCreatePayload, type NoteUpdatePayload } from '../lib/api'
+import { notesApi, type Note, type NoteType, type NoteCreatePayload, type NoteUpdatePayload, type TagSuggestion } from '../lib/api'
 
 const TYPE_OPTIONS: { value: NoteType; label: string; hint: string }[] = [
   { value: 'idea', label: '💡 想法', hint: '灵感/猜想' },
@@ -32,6 +33,11 @@ export function NoteEditorDialog({ open, mode, initial, onClose, onSaved }: Note
   const [pinned, setPinned] = useState(initial?.pinned ?? false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // AI 标签建议
+  const [suggesting, setSuggesting] = useState(false)
+  const [suggestions, setSuggestions] = useState<TagSuggestion[]>([])
+  const [aiError, setAiError] = useState<string | null>(null)
+  const [aiHint, setAiHint] = useState<{ type?: NoteType; latencyMs?: number; model?: string } | null>(null)
   const contentRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
@@ -43,8 +49,73 @@ export function NoteEditorDialog({ open, mode, initial, onClose, onSaved }: Note
       setPinned(initial?.pinned ?? false)
       setError(null)
       setSubmitting(false)
+      setSuggestions([])
+      setAiError(null)
+      setAiHint(null)
     }
   }, [open, initial])
+
+  function parseTags(): string[] {
+    return tagsRaw
+      .split(/[,，\s]+/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+  }
+
+  async function handleSuggestTags() {
+    if (!content.trim()) {
+      setAiError('请先填写内容再让 AI 建议')
+      return
+    }
+    setSuggesting(true)
+    setAiError(null)
+    setSuggestions([])
+    try {
+      const resp = await notesApi.suggestTags({
+        title: title.trim() || undefined,
+        content: content.trim(),
+        existing_tags: parseTags(),
+      })
+      setSuggestions(resp.tags)
+      setAiHint({
+        type: resp.suggested_type ?? undefined,
+        latencyMs: resp.latency_ms,
+        model: resp.model,
+      })
+      if (resp.suggested_type && resp.suggested_type !== type) {
+        // AI 建议的类型提示,不自动覆盖,只 hint,让用户自己决定
+      }
+    } catch (e) {
+      setAiError(String(e instanceof Error ? e.message : e))
+    } finally {
+      setSuggesting(false)
+    }
+  }
+
+  function adoptSuggestion(name: string) {
+    const current = parseTags()
+    if (current.includes(name)) {
+      // 已存在,高亮一下
+      return
+    }
+    const next = [...current, name].join(', ')
+    setTagsRaw(next)
+    setSuggestions((prev) => prev.filter((s) => s.name !== name))
+  }
+
+  function adoptAll() {
+    const current = parseTags()
+    const merged = [...current]
+    for (const s of suggestions) {
+      if (!merged.includes(s.name)) merged.push(s.name)
+    }
+    setTagsRaw(merged.join(', '))
+    setSuggestions([])
+  }
+
+  function adoptType() {
+    if (aiHint?.type) setType(aiHint.type)
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -54,10 +125,7 @@ export function NoteEditorDialog({ open, mode, initial, onClose, onSaved }: Note
     }
     setSubmitting(true)
     setError(null)
-    const tags = tagsRaw
-      .split(/[,，\s]+/)
-      .map((t) => t.trim())
-      .filter(Boolean)
+    const tags = parseTags()
     try {
       let saved: Note
       if (mode === 'create') {
@@ -137,6 +205,76 @@ export function NoteEditorDialog({ open, mode, initial, onClose, onSaved }: Note
           placeholder="标签(逗号分隔,如:半导体, 光模块)"
           className="w-full rounded-btn bg-elevated border border-border px-3 py-2 text-sm text-foreground placeholder:text-muted focus:outline-none focus:border-primary/50"
         />
+
+        {/* AI 建议区 */}
+        <div className="rounded-btn border border-dashed border-border bg-elevated/40 p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 text-xs text-secondary">
+              <Sparkles className="h-3.5 w-3.5 text-primary" />
+              <span>AI 标签建议</span>
+              {aiHint?.model && (
+                <span className="text-muted">· {aiHint.model}</span>
+              )}
+              {typeof aiHint?.latencyMs === 'number' && (
+                <span className="text-muted">· {aiHint.latencyMs}ms</span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              {suggestions.length > 0 && (
+                <button
+                  type="button"
+                  onClick={adoptAll}
+                  className="text-xs text-primary hover:text-primary/80"
+                >
+                  全部采纳
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleSuggestTags}
+                disabled={suggesting || !content.trim()}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-btn text-xs bg-primary/15 text-primary hover:bg-primary/25 disabled:opacity-50"
+              >
+                <Sparkles className="h-3 w-3" />
+                {suggesting ? '分析中…' : '生成建议'}
+              </button>
+            </div>
+          </div>
+
+          {aiError && (
+            <p className="mt-1.5 text-xs text-rose-300">{aiError}</p>
+          )}
+
+          {suggestions.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {suggestions.map((s) => (
+                <button
+                  key={s.name}
+                  type="button"
+                  title={s.reason ? `${(s.confidence * 100).toFixed(0)}% · ${s.reason}` : `${(s.confidence * 100).toFixed(0)}%`}
+                  onClick={() => adoptSuggestion(s.name)}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20"
+                >
+                  {s.name}
+                  <span className="text-[10px] text-muted">{(s.confidence * 100).toFixed(0)}%</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {aiHint?.type && aiHint.type !== type && (
+            <div className="mt-2 flex items-center gap-1.5 text-xs text-secondary">
+              <span>AI 推荐类型:</span>
+              <button
+                type="button"
+                onClick={adoptType}
+                className="px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/30 hover:bg-primary/20"
+              >
+                {TYPE_OPTIONS.find((o) => o.value === aiHint.type)?.label ?? aiHint.type}
+              </button>
+            </div>
+          )}
+        </div>
 
         {/* 置顶 */}
         <label className="flex items-center gap-2 text-sm text-secondary">

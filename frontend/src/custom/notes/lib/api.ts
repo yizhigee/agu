@@ -62,6 +62,20 @@ export interface NoteUpdatePayload {
   type?: NoteType
 }
 
+export interface TagSuggestion {
+  name: string
+  confidence: number
+  reason?: string
+}
+
+export interface SuggestTagsResponse {
+  suggested_type?: NoteType | null
+  suggested_type_confidence?: number | null
+  tags: TagSuggestion[]
+  model?: string
+  latency_ms: number
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -130,5 +144,18 @@ export const notesApi = {
   // Tags
   listTags(): Promise<{ items: Tag[]; count: number }> {
     return request<{ items: Tag[]; count: number }>('/api/custom/notes/tags')
+  },
+
+  // AI
+  suggestTags(payload: {
+    title?: string
+    content: string
+    existing_tags?: string[]
+    max_suggest?: number
+  }): Promise<SuggestTagsResponse> {
+    return request<SuggestTagsResponse>('/api/custom/notes/ai/suggest-tags', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
   },
 }
