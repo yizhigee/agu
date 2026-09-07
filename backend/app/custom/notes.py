@@ -703,6 +703,15 @@ def _build_router() -> APIRouter:
 
         obj = _extract_json_object(text)
         if not isinstance(obj, dict):
+            _audit_ai_call(
+                endpoint="draft_rule",
+                status="error",
+                latency_ms=latency,
+                error_code="non_json_response",
+                input_tokens_estimate=input_est,
+                output_tokens_estimate=output_est,
+                cited_note_count=len(summaries),
+            )
             raise HTTPException(
                 status_code=502,
                 detail="AI 返回非 JSON 格式,无法解析规则草稿",
