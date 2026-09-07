@@ -72,7 +72,7 @@ def test_schema_version(fresh_db: Path) -> None:
     client = _isolated_client(fresh_db)
     response = client.get("/api/custom/notes/schema-version")
     assert response.status_code == 200
-    assert response.json()["version"] == 2  # M1 升到 v2
+    assert response.json()["version"] == 3  # M3 升到 v3 (+ rules 表)
 
 
 # ---------- Notes CRUD ----------

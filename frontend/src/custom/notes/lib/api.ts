@@ -76,6 +76,62 @@ export interface SuggestTagsResponse {
   latency_ms: number
 }
 
+export interface DetectedPattern {
+  cluster_key: string
+  type: NoteType
+  tag: string | null
+  note_count: number
+  sample_note_ids: string[]
+  sample_titles: string[]
+  sample_total: number
+}
+
+export interface DetectPatternsResponse {
+  patterns: DetectedPattern[]
+  total_notes_scanned: number
+}
+
+export interface Rule {
+  id: string
+  category: string
+  title: string
+  trigger_conditions: string[]
+  exceptions: string | null
+  source_note_ids: string[]
+  status: 'active' | 'draft' | 'archived'
+  violation_count: number
+  last_violated_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface RuleCreatePayload {
+  category: string
+  title: string
+  trigger_conditions?: string[]
+  exceptions?: string | null
+  source_note_ids?: string[]
+  status?: 'active' | 'draft' | 'archived'
+}
+
+export interface RuleUpdatePayload {
+  title?: string
+  category?: string
+  trigger_conditions?: string[]
+  exceptions?: string | null
+  status?: 'active' | 'draft' | 'archived'
+}
+
+export interface DraftRuleResponse {
+  category: string
+  title: string
+  trigger_conditions: string[]
+  exceptions: string | null
+  rationale: string
+  model?: string
+  latency_ms: number
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -154,6 +210,48 @@ export const notesApi = {
     max_suggest?: number
   }): Promise<SuggestTagsResponse> {
     return request<SuggestTagsResponse>('/api/custom/notes/ai/suggest-tags', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+
+  // Patterns (M3)
+  detectPatterns(params?: { min_count?: number; limit?: number }): Promise<DetectPatternsResponse> {
+    const qs = new URLSearchParams()
+    if (params?.min_count) qs.set('min_count', String(params.min_count))
+    if (params?.limit) qs.set('limit', String(params.limit))
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return request<DetectPatternsResponse>(`/api/custom/notes/patterns/detect${suffix}`)
+  },
+
+  // Rules (M3)
+  listRules(params?: { status?: 'active' | 'draft' | 'archived' }): Promise<{ items: Rule[]; count: number }> {
+    const qs = params?.status ? `?status=${params.status}` : ''
+    return request<{ items: Rule[]; count: number }>(`/api/custom/notes/rules${qs}`)
+  },
+  createRule(payload: RuleCreatePayload): Promise<Rule> {
+    return request<Rule>('/api/custom/notes/rules', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updateRule(id: string, payload: RuleUpdatePayload): Promise<Rule> {
+    return request<Rule>(`/api/custom/notes/rules/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
+  deleteRule(id: string): Promise<void> {
+    return requestVoid(`/api/custom/notes/rules/${id}`, { method: 'DELETE' })
+  },
+
+  // AI draft rule
+  draftRule(payload: {
+    note_ids: string[]
+    category_hint?: string
+    type_hint?: string
+  }): Promise<DraftRuleResponse> {
+    return request<DraftRuleResponse>('/api/custom/notes/ai/draft-rule', {
       method: 'POST',
       body: JSON.stringify(payload),
     })

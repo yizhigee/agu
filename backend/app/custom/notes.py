@@ -126,6 +126,68 @@ class SuggestTagsResponse(BaseModel):
     latency_ms: int = 0
 
 
+class DetectedPattern(BaseModel):
+    cluster_key: str
+    type: str
+    tag: Optional[str] = None
+    note_count: int
+    sample_note_ids: list[str] = Field(default_factory=list)
+    sample_titles: list[str] = Field(default_factory=list)
+    sample_total: int = 0
+
+
+class DetectPatternsResponse(BaseModel):
+    patterns: list[DetectedPattern] = Field(default_factory=list)
+    total_notes_scanned: int = 0
+
+
+class RuleOut(BaseModel):
+    id: str
+    category: str
+    title: str
+    trigger_conditions: list[str]
+    exceptions: Optional[str] = None
+    source_note_ids: list[str]
+    status: str
+    violation_count: int
+    last_violated_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+
+class RuleCreate(BaseModel):
+    category: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    trigger_conditions: list[str] = Field(default_factory=list)
+    exceptions: Optional[str] = None
+    source_note_ids: list[str] = Field(default_factory=list)
+    status: str = "active"
+
+
+class RuleUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    trigger_conditions: Optional[list[str]] = None
+    exceptions: Optional[str] = None
+    status: Optional[str] = None
+
+
+class DraftRuleRequest(BaseModel):
+    note_ids: list[str] = Field(..., min_length=1)
+    category_hint: Optional[str] = None
+    type_hint: Optional[str] = None
+
+
+class DraftRuleResponse(BaseModel):
+    category: str
+    title: str
+    trigger_conditions: list[str]
+    exceptions: Optional[str] = None
+    rationale: str
+    model: Optional[str] = None
+    latency_ms: int = 0
+
+
 # ---------- AI 辅助 ----------
 
 # 在 setup/startup 中初始化(失败兜底 None)
@@ -482,6 +544,200 @@ def _build_router() -> APIRouter:
             suggested_type=suggested_type,
             suggested_type_confidence=None,
             tags=tags,
+            model=current_ai_model(),
+            latency_ms=latency,
+        )
+
+    # ----- Patterns (M3 模式检测) -----
+
+    @router.get("/patterns/detect")
+    def patterns_detect(min_count: int = 3, limit: int = 10) -> DetectPatternsResponse:
+        patterns = _get_db().detect_patterns(min_count=min_count, limit=limit)
+        total = len(_get_db().list_notes(limit=10000))
+        return DetectPatternsResponse(
+            patterns=[DetectedPattern(**p) for p in patterns],
+            total_notes_scanned=total,
+        )
+
+    # ----- Rules (M3 体系沉淀) -----
+
+    @router.get("/rules")
+    def list_rules(status: Optional[str] = None) -> dict:
+        rules = _get_db().list_rules(status=status)
+        return {"items": rules, "count": len(rules)}
+
+    @router.post("/rules", status_code=201)
+    def create_rule(body: RuleCreate) -> RuleOut:
+        try:
+            rule = _get_db().create_rule(
+                category=body.category,
+                title=body.title,
+                trigger_conditions=body.trigger_conditions,
+                exceptions=body.exceptions,
+                source_note_ids=body.source_note_ids,
+                status=body.status,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return RuleOut(**rule)
+
+    @router.get("/rules/{rule_id}")
+    def get_rule(rule_id: str) -> RuleOut:
+        rule = _get_db().get_rule(rule_id)
+        if not rule:
+            raise HTTPException(status_code=404, detail="rule not found")
+        return RuleOut(**rule)
+
+    @router.patch("/rules/{rule_id}")
+    def update_rule(rule_id: str, body: RuleUpdate) -> RuleOut:
+        patch: dict[str, Any] = {k: v for k, v in body.model_dump().items() if v is not None}
+        rule = _get_db().update_rule(rule_id, patch)
+        if not rule:
+            raise HTTPException(status_code=404, detail="rule not found")
+        return RuleOut(**rule)
+
+    @router.delete("/rules/{rule_id}")
+    def delete_rule(rule_id: str) -> dict:
+        ok = _get_db().delete_rule(rule_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="rule not found")
+        return {"deleted": True, "id": rule_id}
+
+    # ----- AI 规则草稿 (M3 体系沉淀) -----
+
+    @router.post("/ai/draft-rule")
+    async def ai_draft_rule(body: DraftRuleRequest) -> DraftRuleResponse:
+        if not _check_ai_key_configured():
+            _audit_ai_call(
+                endpoint="draft_rule",
+                status="error",
+                latency_ms=0,
+                error_code="ai_key_missing",
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="AI Key 未配置,请在设置页配置后重试",
+            )
+
+        summaries = _get_db().fetch_notes_summary(body.note_ids)
+        if not summaries:
+            raise HTTPException(status_code=400, detail="没有可用的笔记用于提炼")
+
+        from app.services.ai_provider import generate_ai_text, current_ai_model
+
+        # 构造精简摘要,避免 token 爆炸
+        bullets = []
+        for s in summaries:
+            title = (s.get("title") or s.get("content_excerpt") or "")[:60]
+            ntype = s.get("type") or ""
+            tags = ", ".join(s.get("tags") or [])
+            bullets.append(
+                f"- [{ntype}] {title}"
+                + (f" (tags: {tags})" if tags else "")
+                + (f" (pnl: {s.get('pnl')})" if s.get("pnl") is not None else "")
+            )
+        joined = "\n".join(bullets)
+
+        system = (
+            "你是 A 股散户的复盘助手。任务:从用户给出的多条笔记摘要中提炼一条可执行的"
+            "规则草稿(rule draft)。\n"
+            "要求:\n"
+            "- rule 必须能从这些笔记里归纳出来(有 ≥2 条支撑)\n"
+            "- 简短直接,标题 ≤ 24 字\n"
+            "- trigger_conditions 数组:1-4 条简短条件,每条 ≤ 24 字\n"
+            "- exceptions:可选,描述该规则不适用的场景,≤ 60 字\n"
+            "- rationale: ≤ 120 字,说明为什么这些笔记支持该规则\n"
+            "- 严格 JSON 输出,不要 markdown 围栏以外的内容\n"
+            "如果这些笔记之间没有共同模式,返回 title='暂无可提炼的规则',trigger_conditions 为空"
+        )
+        hint_parts = []
+        if body.category_hint:
+            hint_parts.append(f"category_hint: {body.category_hint}")
+        if body.type_hint:
+            hint_parts.append(f"type_hint: {body.type_hint}")
+        hint_block = ("\n用户偏好: " + "; ".join(hint_parts)) if hint_parts else ""
+        user = (
+            f"以下 {len(summaries)} 条相关笔记:{hint_block}\n\n{joined}\n\n"
+            "输出 schema:\n"
+            "{\n"
+            '  "category": "分类(2-8字)",\n'
+            '  "title": "规则标题",\n'
+            '  "trigger_conditions": ["条件1", "条件2"],\n'
+            '  "exceptions": "例外场景或null",\n'
+            '  "rationale": "为什么这些笔记支持这条规则"\n'
+            "}"
+        )
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        input_est = sum((len(m["content"]) // 4) + 1 for m in messages)
+
+        start = time.monotonic()
+        status = "success"
+        error_code: Optional[str] = None
+        text = ""
+        try:
+            text = await generate_ai_text(
+                messages, temperature=0.3, max_tokens=500, timeout=60.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            status = "error"
+            error_code = exc.__class__.__name__
+            latency = int((time.monotonic() - start) * 1000)
+            _audit_ai_call(
+                endpoint="draft_rule",
+                status=status,
+                latency_ms=latency,
+                error_code=error_code,
+                input_tokens_estimate=input_est,
+                cited_note_count=len(summaries),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"AI 服务调用失败: {exc}",
+            ) from exc
+        latency = int((time.monotonic() - start) * 1000)
+        output_est = max(1, len(text) // 4)
+
+        obj = _extract_json_object(text)
+        if not isinstance(obj, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="AI 返回非 JSON 格式,无法解析规则草稿",
+            )
+        title = str(obj.get("title") or "").strip()[:80]
+        category = str(obj.get("category") or body.category_hint or "复盘").strip()[:32]
+        raw_triggers = obj.get("trigger_conditions") or []
+        if not isinstance(raw_triggers, list):
+            raw_triggers = []
+        triggers = [str(t).strip()[:60] for t in raw_triggers if str(t).strip()][:6]
+        exceptions_raw = obj.get("exceptions")
+        exceptions = str(exceptions_raw).strip()[:200] if exceptions_raw else None
+        rationale = str(obj.get("rationale") or "").strip()[:240]
+
+        if not title or not triggers:
+            raise HTTPException(
+                status_code=422,
+                detail="AI 未提炼出有效规则(可能笔记之间无共同模式),请补充更多相关笔记后再试",
+            )
+
+        _audit_ai_call(
+            endpoint="draft_rule",
+            status=status,
+            latency_ms=latency,
+            error_code=error_code,
+            input_tokens_estimate=input_est,
+            output_tokens_estimate=output_est,
+            cited_note_count=len(summaries),
+        )
+        return DraftRuleResponse(
+            category=category,
+            title=title,
+            trigger_conditions=triggers,
+            exceptions=exceptions,
+            rationale=rationale,
             model=current_ai_model(),
             latency_ms=latency,
         )

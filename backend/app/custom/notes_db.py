@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 CURRENT_USER = "local"  # 预留多用户:本期恒为 "local"
 
 # 当前 schema 版本(写到 meta 表)
-SCHEMA_VERSION = 2  # M1:notes/tags/note_tags/meta 四表 + 软删
+SCHEMA_VERSION = 3  # M3:+ rules 表(从笔记聚类提炼的规则沉淀)
 
 
 # ---------- 时间戳工具 ----------
@@ -187,6 +187,32 @@ class NotesDB:
                 )
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_notes_deleted ON notes(user_id, deleted_at)"
+                )
+
+            if current < 3:
+                # v3 = M3:rules 表 — 从同类笔记聚类提炼的"我的规则"
+                # category 用于聚合(同 category 内 source_note_ids 互相印证);
+                # source_note_ids JSON 数组是体系可信度的基石 → 可一键回溯
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS rules (
+                        id                TEXT PRIMARY KEY,
+                        user_id           TEXT NOT NULL DEFAULT 'local',
+                        category          TEXT NOT NULL,
+                        title             TEXT NOT NULL,
+                        trigger_conditions TEXT NOT NULL DEFAULT '[]',
+                        exceptions        TEXT,
+                        source_note_ids   TEXT NOT NULL DEFAULT '[]',
+                        status            TEXT NOT NULL DEFAULT 'active',
+                        violation_count   INTEGER NOT NULL DEFAULT 0,
+                        last_violated_at  TEXT,
+                        created_at        TEXT NOT NULL,
+                        updated_at        TEXT NOT NULL
+                    )
+                    """
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_rules_user_category ON rules(user_id, category, status)"
                 )
 
             self._conn.execute(
@@ -413,6 +439,209 @@ class NotesDB:
         tags = self.list_tags()
         return next(t for t in tags if t["id"] == tag_id)
 
+    # ---------- Rules CRUD (M3) ----------
+
+    def list_rules(self, *, status: Optional[str] = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM rules WHERE user_id = ?"
+        params: list[Any] = [CURRENT_USER]
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC"
+        rows = self.execute(sql, tuple(params)).fetchall()
+        return [_row_to_rule(r) for r in rows]
+
+    def get_rule(self, rule_id: str) -> Optional[dict[str, Any]]:
+        row = self.execute(
+            "SELECT * FROM rules WHERE user_id = ? AND id = ?",
+            (CURRENT_USER, rule_id),
+        ).fetchone()
+        return _row_to_rule(row) if row else None
+
+    def create_rule(
+        self,
+        *,
+        category: str,
+        title: str,
+        trigger_conditions: list[str],
+        exceptions: Optional[str] = None,
+        source_note_ids: list[str],
+        status: str = "active",
+    ) -> dict[str, Any]:
+        category = (category or "").strip()
+        title = (title or "").strip()
+        if not category:
+            raise ValueError("category is required")
+        if not title:
+            raise ValueError("title is required")
+        if status not in ("active", "draft", "archived"):
+            raise ValueError(f"invalid status: {status}")
+        rule_id = _gen_id()
+        now = _now_iso()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO rules(
+                    id, user_id, category, title, trigger_conditions, exceptions,
+                    source_note_ids, status, violation_count, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    rule_id, CURRENT_USER, category, title,
+                    json.dumps(trigger_conditions, ensure_ascii=False),
+                    exceptions,
+                    json.dumps(source_note_ids, ensure_ascii=False),
+                    status, 0, now, now,
+                ),
+            )
+        rule = self.get_rule(rule_id)
+        assert rule is not None
+        return rule
+
+    def update_rule(self, rule_id: str, patch: dict[str, Any]) -> Optional[dict[str, Any]]:
+        allowed = {"title", "category", "trigger_conditions", "exceptions", "status", "violation_count"}
+        sets: list[str] = []
+        params: list[Any] = []
+        for k, v in patch.items():
+            if k not in allowed:
+                continue
+            if k in ("trigger_conditions",) and isinstance(v, list):
+                v = json.dumps(v, ensure_ascii=False)
+            sets.append(f"{k} = ?")
+            params.append(v)
+        if not sets:
+            return self.get_rule(rule_id)
+        sets.append("updated_at = ?")
+        params.append(_now_iso())
+        params.extend([CURRENT_USER, rule_id])
+        with self._tx() as conn:
+            cur = conn.execute(
+                f"UPDATE rules SET {', '.join(sets)} WHERE user_id = ? AND id = ?",
+                tuple(params),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_rule(rule_id)
+
+    def delete_rule(self, rule_id: str) -> bool:
+        with self._tx() as conn:
+            cur = conn.execute(
+                "DELETE FROM rules WHERE user_id = ? AND id = ?",
+                (CURRENT_USER, rule_id),
+            )
+            return cur.rowcount > 0
+
+    # ---------- Patterns (聚类检测,纯只读,不入库) ----------
+
+    def detect_patterns(self, *, min_count: int = 3, limit: int = 10) -> list[dict[str, Any]]:
+        """按 (type, 共享 tag) 聚类,返回反复出现的主题。
+
+        聚类策略:
+        - 只看 type IN (pitfall / knowledge / review) 这三种有"经验"属性的笔记
+        - 按 tag 聚合(共享同一个 tag 的笔记 ≥ min_count → 形成一个 pattern)
+        - 同时按"纯 type"聚合(type 整体 ≥ min_count*2 → 也形成 pattern,标签云的简化版)
+
+        返回 [{cluster_key, type, tag?, note_count, sample_note_ids, sample_titles}]
+        cluster_key 用于跨刷新去重(UI 不会闪)
+        """
+        min_count = max(2, min_count)
+        limit = max(1, min(50, limit))
+
+        patterns: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+
+        # ---- 1) 按 tag 聚合(限定有意义类型)----
+        sql = """
+            SELECT t.name AS tag, n.type AS type, COUNT(*) AS cnt,
+                   GROUP_CONCAT(n.id) AS note_ids,
+                   GROUP_CONCAT(COALESCE(n.title, substr(n.content, 1, 30))) AS titles
+            FROM notes n
+            JOIN note_tags nt ON nt.note_id = n.id
+            JOIN tags t ON t.id = nt.tag_id
+            WHERE n.user_id = ? AND n.deleted_at IS NULL
+              AND n.type IN ('pitfall', 'knowledge', 'review')
+              AND t.merged_into IS NULL
+            GROUP BY t.name, n.type
+            HAVING cnt >= ?
+            ORDER BY cnt DESC
+            LIMIT ?
+        """
+        for row in self.execute(sql, (CURRENT_USER, min_count, limit * 2)).fetchall():
+            tag = row["tag"]
+            ntype = row["type"]
+            cnt = int(row["cnt"])
+            key = f"tag:{ntype}:{tag}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            note_ids = [x for x in (row["note_ids"] or "").split(",") if x]
+            titles = [x for x in (row["titles"] or "").split(",") if x]
+            patterns.append({
+                "cluster_key": key,
+                "type": ntype,
+                "tag": tag,
+                "note_count": cnt,
+                "sample_note_ids": note_ids[:5],
+                "sample_titles": titles[:5],
+                "sample_total": len(note_ids),
+            })
+
+        # ---- 2) 按纯 type 聚合(无 tag 时也提示"你 pitfall 笔记偏多")----
+        sql2 = """
+            SELECT type, COUNT(*) AS cnt,
+                   GROUP_CONCAT(id) AS note_ids,
+                   GROUP_CONCAT(COALESCE(title, substr(content, 1, 30))) AS titles
+            FROM notes
+            WHERE user_id = ? AND deleted_at IS NULL
+              AND type IN ('pitfall', 'knowledge', 'review')
+            GROUP BY type
+            HAVING cnt >= ?
+            ORDER BY cnt DESC
+        """
+        for row in self.execute(sql2, (CURRENT_USER, min_count * 2)).fetchall():
+            ntype = row["type"]
+            cnt = int(row["cnt"])
+            key = f"type:{ntype}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            note_ids = [x for x in (row["note_ids"] or "").split(",") if x]
+            titles = [x for x in (row["titles"] or "").split(",") if x]
+            patterns.append({
+                "cluster_key": key,
+                "type": ntype,
+                "tag": None,
+                "note_count": cnt,
+                "sample_note_ids": note_ids[:5],
+                "sample_titles": titles[:5],
+                "sample_total": len(note_ids),
+            })
+
+        patterns.sort(key=lambda p: p["note_count"], reverse=True)
+        return patterns[:limit]
+
+    def fetch_notes_summary(self, note_ids: list[str]) -> list[dict[str, Any]]:
+        """给 AI 提炼规则时,聚合相关笔记的摘要(只取关键字段,避免上下文爆炸)。"""
+        if not note_ids:
+            return []
+        placeholders = ",".join("?" * len(note_ids))
+        sql = f"""
+            SELECT id, type, title, substr(content, 1, 200) AS content_excerpt,
+                   tags, related_stocks, pnl, mood, created_at
+            FROM notes
+            WHERE user_id = ? AND id IN ({placeholders}) AND deleted_at IS NULL
+            ORDER BY created_at DESC
+        """
+        params: tuple[Any, ...] = (CURRENT_USER,) + tuple(note_ids)
+        rows = self.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["tags"] = json.loads(d.get("tags") or "[]")
+            d["related_stocks"] = json.loads(d.get("related_stocks") or "[]")
+            out.append(d)
+        return out
+
 
 # ---------- 行 → dict ----------
 
@@ -426,3 +655,11 @@ def _row_to_note(row: sqlite3.Row) -> dict[str, Any]:
 
 def _row_to_tag(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
+
+
+def _row_to_rule(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    d["trigger_conditions"] = json.loads(d.get("trigger_conditions") or "[]")
+    d["source_note_ids"] = json.loads(d.get("source_note_ids") or "[]")
+    d["violation_count"] = int(d.get("violation_count") or 0)
+    return d
