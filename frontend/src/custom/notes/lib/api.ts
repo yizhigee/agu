@@ -168,11 +168,13 @@ export const notesApi = {
     type?: NoteType
     search?: string
     pinned_only?: boolean
+    deleted?: boolean
   }): Promise<{ items: Note[]; count: number }> {
     const qs = new URLSearchParams()
     if (params?.type) qs.set('type', params.type)
     if (params?.search) qs.set('search', params.search)
     if (params?.pinned_only) qs.set('pinned_only', 'true')
+    if (params?.deleted) qs.set('deleted', 'true')
     const suffix = qs.toString() ? `?${qs.toString()}` : ''
     return request<{ items: Note[]; count: number }>(`/api/custom/notes/notes${suffix}`)
   },
@@ -195,6 +197,9 @@ export const notesApi = {
     const suffix = hard ? '?hard=true' : ''
     return requestVoid(`/api/custom/notes/notes/${id}${suffix}`, { method: 'DELETE' })
       .then(() => ({ deleted: true, hard, id }))
+  },
+  restoreNote(id: string): Promise<Note> {
+    return request<Note>(`/api/custom/notes/notes/${id}/restore`, { method: 'POST' })
   },
 
   // Tags

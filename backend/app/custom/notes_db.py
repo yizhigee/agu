@@ -233,10 +233,13 @@ class NotesDB:
         tag_filter: Optional[str] = None,
         pinned_only: bool = False,
         search: Optional[str] = None,
+        deleted: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM notes WHERE user_id = ? AND deleted_at IS NULL"
+        # deleted=False(默认):只返回未软删;deleted=True:只返回已软删(回收站)。
+        deleted_clause = "deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL"
+        sql = f"SELECT * FROM notes WHERE user_id = ? AND {deleted_clause}"
         params: list[Any] = [CURRENT_USER]
         if type_filter:
             sql += " AND type = ?"
@@ -247,7 +250,8 @@ class NotesDB:
             sql += " AND (title LIKE ? OR content LIKE ?)"
             like = f"%{search}%"
             params.extend([like, like])
-        sql += " ORDER BY pinned DESC, created_at DESC LIMIT ? OFFSET ?"
+        order = "deleted_at DESC" if deleted else "pinned DESC, created_at DESC"
+        sql += f" ORDER BY {order} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = self.execute(sql, tuple(params)).fetchall()
         if tag_filter:
@@ -384,6 +388,16 @@ class NotesDB:
                     "WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
                     (_now_iso(), _now_iso(), note_id, CURRENT_USER),
                 )
+            return cur.rowcount > 0
+
+    def restore_note(self, note_id: str) -> bool:
+        """把软删笔记恢复到正常(清空 deleted_at)。仅对已软删的生效。"""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE notes SET deleted_at = NULL, updated_at = ? "
+                "WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL",
+                (_now_iso(), note_id, CURRENT_USER),
+            )
             return cur.rowcount > 0
 
     # ---------- Tags CRUD ----------

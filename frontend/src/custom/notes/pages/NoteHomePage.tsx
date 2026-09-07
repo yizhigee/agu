@@ -7,6 +7,7 @@ import {
   ArchiveRestore,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   Sparkles,
   Trash2,
@@ -28,7 +29,7 @@ const TYPE_FILTERS: { value: NoteType | 'all'; label: string }[] = [
   { value: 'question', label: '❓ 疑问' },
 ]
 
-type Tab = 'notes' | 'patterns' | 'rules'
+type Tab = 'notes' | 'patterns' | 'rules' | 'trash'
 
 function formatTime(iso: string): string {
   const d = new Date(iso)
@@ -72,6 +73,10 @@ export function NoteHomePage() {
   const [rulesLoading, setRulesLoading] = useState(false)
   const [ruleFilter, setRuleFilter] = useState<'active' | 'all' | 'archived'>('active')
 
+  // ---- Trash state ----
+  const [trashNotes, setTrashNotes] = useState<Note[]>([])
+  const [trashLoading, setTrashLoading] = useState(false)
+
   // ---- Reloads ----
   const reloadNotes = useCallback(async () => {
     setLoading(true)
@@ -114,11 +119,24 @@ export function NoteHomePage() {
     }
   }, [ruleFilter])
 
+  const reloadTrash = useCallback(async () => {
+    setTrashLoading(true)
+    try {
+      const res = await notesApi.listNotes({ deleted: true })
+      setTrashNotes(res.items)
+    } catch (e) {
+      toast(`加载回收站失败:${e}`, 'error')
+    } finally {
+      setTrashLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     if (tab === 'notes') void reloadNotes()
     else if (tab === 'patterns') void reloadPatterns()
     else if (tab === 'rules') void reloadRules()
-  }, [tab, reloadNotes, reloadPatterns, reloadRules])
+    else if (tab === 'trash') void reloadTrash()
+  }, [tab, reloadNotes, reloadPatterns, reloadRules, reloadTrash])
 
   // ---- Handlers ----
   function openCreate() {
@@ -168,6 +186,28 @@ export function NoteHomePage() {
     }
   }
 
+  async function restoreNote(note: Note) {
+    try {
+      await notesApi.restoreNote(note.id)
+      toast('已恢复到笔记列表', 'success')
+      void reloadTrash()
+    } catch (e) {
+      toast(`恢复失败:${e}`, 'error')
+    }
+  }
+
+  async function purgeNote(note: Note) {
+    const preview = note.title || note.content.slice(0, 30)
+    if (!confirm(`彻底删除"${preview}"?\n此操作不可恢复。`)) return
+    try {
+      await notesApi.deleteNote(note.id, true)
+      toast('已彻底删除', 'success')
+      void reloadTrash()
+    } catch (e) {
+      toast(`删除失败:${e}`, 'error')
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4 p-4">
       <PageHeader
@@ -192,6 +232,7 @@ export function NoteHomePage() {
             { v: 'notes', label: '📝 笔记' },
             { v: 'patterns', label: '🔍 模式' },
             { v: 'rules', label: '🎯 我的规则' },
+            { v: 'trash', label: '🗑️ 回收站' },
           ] as { v: Tab; label: string }[]
         ).map((t) => (
           <button
@@ -454,6 +495,66 @@ export function NoteHomePage() {
                         type="button"
                         onClick={() => void removeRule(rule)}
                         title="删除"
+                        className="p-1.5 rounded-btn text-muted hover:text-rose-300 hover:bg-surface"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ---- Trash tab ---- */}
+      {tab === 'trash' && (
+        <>
+          <div className="flex items-center gap-2 text-xs text-muted">
+            <span>软删除的笔记会暂存在这里,可恢复或彻底清除。</span>
+          </div>
+
+          <div className="rounded-card border border-border bg-elevated">
+            {trashLoading ? (
+              <div className="p-6 text-sm text-muted">加载中…</div>
+            ) : trashNotes.length === 0 ? (
+              <div className="p-6 text-sm text-muted">回收站是空的 🎉</div>
+            ) : (
+              <ul className="divide-y divide-border">
+                {trashNotes.map((note) => (
+                  <li key={note.id} className="p-3 flex items-start gap-3">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 text-xs text-muted">
+                        <span>删除于 {formatTime(note.deleted_at ?? '')}</span>
+                        {note.tags.length > 0 && (
+                          <span className="text-secondary truncate">
+                            {note.tags.map((t) => `#${t}`).join(' ')}
+                          </span>
+                        )}
+                      </div>
+                      {note.title && (
+                        <h3 className="mt-1 text-sm font-medium text-foreground line-through decoration-muted/50">
+                          {note.title}
+                        </h3>
+                      )}
+                      <p className="mt-1 text-sm text-secondary line-clamp-2 whitespace-pre-wrap">
+                        {note.content}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => void restoreNote(note)}
+                        title="恢复"
+                        className="p-1.5 rounded-btn text-muted hover:text-emerald-300 hover:bg-surface"
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void purgeNote(note)}
+                        title="彻底删除(不可恢复)"
                         className="p-1.5 rounded-btn text-muted hover:text-rose-300 hover:bg-surface"
                       >
                         <Trash2 className="h-4 w-4" />

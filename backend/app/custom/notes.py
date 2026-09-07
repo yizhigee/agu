@@ -403,6 +403,7 @@ def _build_router() -> APIRouter:
         tag: Optional[str] = None,
         pinned_only: bool = False,
         search: Optional[str] = None,
+        deleted: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> dict:
@@ -411,6 +412,7 @@ def _build_router() -> APIRouter:
             tag_filter=tag,
             pinned_only=pinned_only,
             search=search,
+            deleted=deleted,
             limit=limit,
             offset=offset,
         )
@@ -456,6 +458,16 @@ def _build_router() -> APIRouter:
         if not ok:
             raise HTTPException(status_code=404, detail="note not found or already deleted")
         return {"deleted": True, "hard": hard, "id": note_id}
+
+    @router.post("/notes/{note_id}/restore")
+    def restore_note(note_id: str) -> dict:
+        ok = _get_db().restore_note(note_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="note not found or not deleted")
+        note = _get_db().get_note(note_id)
+        if not note:
+            raise HTTPException(status_code=500, detail="restore succeeded but note missing")
+        return note
 
     # ----- Tags CRUD(M1 仅 GET + POST;改/删留 v2.0)-----
 
