@@ -653,27 +653,26 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 
   const switchProvider = useMutation({
     mutationFn: async (name: string) => {
-      // 一键套用: 该源适配了哪些数据集就接管哪些, 其余回默认
+      // 一键套用: 该源适配了哪些数据集就接管哪些; 其余能力保持不变,
+      // 不打断用户已在「能力路由」区配好的精细组合 (如 minute 已切 stock-sdk)。
       if (name === 'tickflow') {
         return api.updateDataProviders(DEFAULT_ROUTING)
       }
       const supported = new Set(
         allItems.find(s => s.name === name)?.datasets ?? []
       )
-      const pick = (dataset: string) =>
-        supported.has(dataset) ? name : DEFAULT_ROUTING[`${dataset}_data_provider` as ProviderField] ?? 'tickflow'
-      return api.updateDataProviders({
-        daily_data_provider: pick('daily'),
-        adj_factor_provider: pick('adj_factor'),
-        realtime_data_provider: pick('realtime'),
-        minute_data_provider: pick('minute'),
-        financial_data_provider: pick('financial'),
-      })
+      const changes: Partial<Record<ProviderField, string>> = {}
+      for (const dataset of ['daily', 'adj_factor', 'realtime', 'minute', 'financial'] as const) {
+        if (supported.has(dataset)) {
+          changes[`${dataset}_data_provider` as ProviderField] = name
+        }
+      }
+      return api.updateDataProviders(changes)
     },
     onSuccess: (_d, name) => {
       invalidateSources()
       const display = allItems.find(s => s.name === name)?.display_name || name
-      toast(`已让「${display}」接管其适配的能力`, 'success')
+      toast(`已让「${display}」接管其适配的能力(其余保持不变)`, 'success')
     },
     onError: (e: Error) => toast(`切换失败: ${e.message}`, 'error'),
   })
@@ -907,7 +906,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
         <div className="mt-3 flex items-center gap-3 text-[10px] text-muted/50 flex-wrap">
           <span>芯片: 高亮=服务中 · 灰=已适配 · <Lock className="inline h-2.5 w-2.5" />=需更高档位</span>
           <span className="text-muted/30">·</span>
-          <span>单击卡片查看介绍与配置, 点「套用」让该源接管其适配的全部能力</span>
+          <span>单击卡片查看介绍与配置, 点「套用」让该源接管其适配的能力(其余保持不变); 组合搭配用上方「能力路由」</span>
         </div>
 
       </section>
