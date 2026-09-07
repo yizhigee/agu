@@ -82,6 +82,8 @@ export function RuleDraftDialog({ open, pattern, onClose, onAdopted }: RuleDraft
     }
   }
 
+  if (!open) return null
+
   return (
     <Modal
       onClose={onClose}

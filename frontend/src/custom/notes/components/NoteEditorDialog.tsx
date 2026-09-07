@@ -147,6 +147,8 @@ export function NoteEditorDialog({ open, mode, initial, onClose, onSaved }: Note
     }
   }
 
+  if (!open) return null
+
   return (
     <Modal
       onClose={onClose}
